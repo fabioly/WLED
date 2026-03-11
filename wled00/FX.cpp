@@ -4471,6 +4471,171 @@ static const char _data_FX_MODE_WASHING_MACHINE[] PROGMEM = "Washing Machine@!,!
 
 
 /*
+ * Spa Bliss - Ultimate smooth ambient effect for spa/relaxation environments.
+ * Multi-layered animation with noise-driven parameter morphing.
+ * Inspired by Pacifica (layered sine waves) and NoisePal (dynamic palette blending).
+ * Designed for RGBW strips (SK6812) with warm white channel management.
+ * by Claude & Fabri
+ */
+//122 bytes
+typedef struct SpaBliss {
+  CRGBPalette16 palCurrent;     // 48 bytes - current blended palette
+  CRGBPalette16 palTarget;      // 48 bytes - target palette being blended toward
+  uint32_t lastPalChange;       //  4 bytes - millis() of last target palette change
+  uint16_t ciStart[4];          //  8 bytes - color index start for each of 4 layers
+  uint16_t noiseZ;              //  2 bytes - slowly evolving Z coordinate for noise
+  uint16_t evolveX;             //  2 bytes - X offset for parameter-evolution noise
+  uint16_t evolveY;             //  2 bytes - Y offset for parameter-evolution noise
+  uint8_t  layerWeights[4];     //  4 bytes - current blend weight of each layer (0-255)
+  uint8_t  targetWeights[4];    //  4 bytes - target blend weights (slowly approached)
+} spa_bliss;
+
+uint16_t mode_spa(void) {
+  if (SEGLEN == 1) return mode_static();
+
+  // --- 1. Allocate and initialize persistent data ---
+  unsigned dataSize = sizeof(spa_bliss);
+  if (!SEGENV.allocateData(dataSize)) return mode_static();
+  SpaBliss* spa = reinterpret_cast<SpaBliss*>(SEGENV.data);
+
+  if (SEGENV.call == 0) {
+    spa->palCurrent = SEGPALETTE;
+    spa->palTarget  = SEGPALETTE;
+    spa->lastPalChange = strip.now;
+    memset(spa->ciStart, 0, sizeof(spa->ciStart));
+    spa->noiseZ = 0;
+    spa->evolveX = random16();
+    spa->evolveY = random16();
+    // Balanced starting weights: Tide dominant, Ripple medium, Breath always, Shimmer subtle
+    spa->layerWeights[0] = 180; spa->layerWeights[1] = 140;
+    spa->layerWeights[2] = 200; spa->layerWeights[3] = 60;
+    memcpy(spa->targetWeights, spa->layerWeights, 4);
+  }
+
+  // --- 2. Timing ---
+  // Speed slider: 0=glacial (~0.25x), 128=normal (~1x), 255=flowing (~1.7x)
+  unsigned speedMult = 64 + ((unsigned)SEGMENT.speed * 3 / 2); // range 64-446
+  uint32_t deltams = FRAMETIME;
+  uint32_t scaledDelta = (deltams * speedMult) >> 8;
+
+  // --- 3. Ultra-slow parameter evolution ---
+  spa->evolveX += 1;
+  spa->evolveY += 1;
+  spa->noiseZ  += scaledDelta;
+
+  // Palette evolution: change target every 15-40 seconds (slower speed = longer intervals)
+  unsigned palInterval = 15000 + (unsigned)(255 - SEGMENT.speed) * 100;
+  if (strip.now - spa->lastPalChange > palInterval) {
+    spa->lastPalChange = strip.now;
+    if (SEGMENT.palette == 0) {
+      // No palette selected: generate spa-appropriate muted tones
+      uint8_t baseHue = inoise8(spa->evolveX >> 3, 0);
+      uint8_t sat = 140 + inoise8(0, spa->evolveY >> 3) / 4; // 140-203 (muted, not fully saturated)
+      spa->palTarget = CRGBPalette16(
+        CHSV(baseHue,       sat,      180),
+        CHSV(baseHue + 40,  sat - 30, 200),
+        CHSV(baseHue + 96,  sat,      160),
+        CHSV(baseHue + 160, sat - 20, 190)
+      );
+    } else {
+      spa->palTarget = SEGPALETTE;
+    }
+  }
+  // Blend current palette toward target (~2.3s full transition at 42fps)
+  nblendPaletteTowardPalette(spa->palCurrent, spa->palTarget, 24);
+
+  // If user selected a specific palette, always track it
+  if (SEGMENT.palette > 0) {
+    CRGBPalette16 userPal = SEGPALETTE;
+    nblendPaletteTowardPalette(spa->palCurrent, userPal, 24);
+  }
+
+  // Layer weight evolution: new targets driven by ultra-slow noise (~30s personality shifts)
+  if (strip.now - SEGENV.step > 30000) {
+    SEGENV.step = strip.now;
+    uint8_t personality = inoise8(spa->evolveX >> 4, spa->evolveY >> 4);
+    if (personality < 64) {        // Wavy: emphasize Tide
+      spa->targetWeights[0] = 220; spa->targetWeights[1] = 100;
+      spa->targetWeights[2] = 180; spa->targetWeights[3] = 40;
+    } else if (personality < 128) { // Textured: emphasize Ripple
+      spa->targetWeights[0] = 140; spa->targetWeights[1] = 200;
+      spa->targetWeights[2] = 180; spa->targetWeights[3] = 80;
+    } else if (personality < 192) { // Meditative: emphasize Breath
+      spa->targetWeights[0] = 160; spa->targetWeights[1] = 120;
+      spa->targetWeights[2] = 240; spa->targetWeights[3] = 50;
+    } else {                        // Sparkling: emphasize Shimmer
+      spa->targetWeights[0] = 150; spa->targetWeights[1] = 130;
+      spa->targetWeights[2] = 180; spa->targetWeights[3] = 160;
+    }
+  }
+  // Blend weights toward targets (1 unit per frame = ~6s for full 255 change)
+  for (int l = 0; l < 4; l++) {
+    if (spa->layerWeights[l] < spa->targetWeights[l]) spa->layerWeights[l]++;
+    else if (spa->layerWeights[l] > spa->targetWeights[l]) spa->layerWeights[l]--;
+  }
+
+  // --- 4. Update layer phase counters (Pacifica-style with evolving speeds) ---
+  unsigned sf1 = beatsin16_t(2, 150, 300);
+  unsigned sf2 = beatsin16_t(3, 150, 280);
+  spa->ciStart[0] += (scaledDelta * sf1) >> 8;
+  spa->ciStart[1] -= (scaledDelta * sf2) >> 8;
+  spa->ciStart[2] += scaledDelta * 2;
+  spa->ciStart[3] -= (scaledDelta * beatsin16_t(5, 3, 8));
+
+  // --- 5. Intensity slider: visual complexity ---
+  uint8_t complexity = SEGMENT.intensity;
+  uint8_t effWeights[4];
+  effWeights[0] = spa->layerWeights[0];                        // Tide: always full
+  effWeights[1] = scale8(spa->layerWeights[1], complexity);    // Ripple: scales with intensity
+  effWeights[2] = spa->layerWeights[2];                        // Breath: always present
+  effWeights[3] = scale8(spa->layerWeights[3], complexity);    // Shimmer: scales with intensity
+
+  // Noise scale for Ripple layer (evolves slowly with complexity)
+  unsigned noiseScale = 15 + (complexity >> 2) + (inoise8(spa->evolveX >> 3, 100) >> 3);
+
+  // --- 6. Global breath modulation (very subtle: 86%-100% brightness at 2-6 BPM) ---
+  uint8_t breathBri = beatsin8_t(2 + (SEGMENT.speed >> 6), 220, 255);
+
+  // White channel warmth (evolves slowly)
+  uint8_t warmth = 140 + (inoise8(spa->evolveX >> 4, 200) >> 2); // 140-203
+
+  // --- 7. Render each pixel ---
+  for (int i = 0; i < SEGLEN; i++) {
+    // Layer 0: Tide - wide slow sine waves
+    unsigned waveAngle0 = spa->ciStart[0] + ((unsigned)i * beatsin16_t(2, 8 * 256, 14 * 256));
+    uint8_t sindex0 = ((sin16_t(waveAngle0) + 32768) * 240) >> 16;
+    CRGB c = ColorFromPalette(spa->palCurrent, sindex0, effWeights[0], LINEARBLEND);
+
+    // Layer 1: Ripple - Perlin noise texture
+    uint8_t noiseVal = inoise8(i * noiseScale, (spa->noiseZ >> 4) + i * (noiseScale >> 1));
+    CRGB c1 = ColorFromPalette(spa->palCurrent, noiseVal + 64, effWeights[1], LINEARBLEND);
+    c += c1;
+
+    // Layer 3: Shimmer - sparse bright highlights from high-res noise
+    uint16_t shimmerNoise = inoise16((uint32_t)i * 400, spa->noiseZ >> 2);
+    unsigned shimmerThresh = 42000 - ((unsigned)complexity * 64);
+    if (shimmerNoise > shimmerThresh) {
+      uint8_t shimmerBri = ((uint32_t)(shimmerNoise - shimmerThresh) * effWeights[3]) / (65535 - shimmerThresh);
+      c += CRGB(shimmerBri >> 1, shimmerBri >> 1, shimmerBri); // slightly cool white accent
+    }
+
+    // Layer 2: Breath - global brightness modulation (multiplicative)
+    c.nscale8(breathBri);
+
+    // RGBW: compute warm white channel
+    uint8_t avgLight = c.getAverageLight();
+    uint8_t wChan = scale8(avgLight, warmth);
+    c.nscale8(255 - (wChan >> 2)); // reduce RGB slightly when W is active
+
+    SEGMENT.setPixelColor(i, RGBW32(c.r, c.g, c.b, wChan));
+  }
+
+  return FRAMETIME;
+}
+static const char _data_FX_MODE_SPA[] PROGMEM = "Spa Bliss@Speed,Complexity;;!;;sx=80,ix=160,pal=50";
+
+
+/*
   Blends random colors across palette
   Modified, originally by Mark Kriegsman https://gist.github.com/kriegsman/1f7ccbbfa492a73c015e
 */
@@ -7947,6 +8112,7 @@ void WS2812FX::setupEffectData() {
   addEffect(FX_MODE_CHUNCHUN, &mode_chunchun, _data_FX_MODE_CHUNCHUN);
   addEffect(FX_MODE_DANCING_SHADOWS, &mode_dancing_shadows, _data_FX_MODE_DANCING_SHADOWS);
   addEffect(FX_MODE_WASHING_MACHINE, &mode_washing_machine, _data_FX_MODE_WASHING_MACHINE);
+  addEffect(FX_MODE_SPA, &mode_spa, _data_FX_MODE_SPA);
 
   addEffect(FX_MODE_BLENDS, &mode_blends, _data_FX_MODE_BLENDS);
   addEffect(FX_MODE_TV_SIMULATOR, &mode_tv_simulator, _data_FX_MODE_TV_SIMULATOR);

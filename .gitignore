@@ -13,7 +13,11 @@ platformio_override.ini
 replace_fs.py
 wled-update.sh
 
-/build_output/
+/build_output/*
+!/build_output/release/
+/build_output/release/*
+!/build_output/release/WLED_0.15.3_ESP32_GhostClick.bin
+!/build_output/release/WLED_0.15.3_ESP32_SpaBliss.bin
 /node_modules/
 /logs/
 
