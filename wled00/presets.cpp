@@ -209,6 +209,7 @@ void handlePresets()
 
   releaseJSONBufferLock();
   if (changePreset) notify(tmpMode); // force UDP notification
+  lastPresetApplyTime = millis();
   stateUpdated(tmpMode);  // was colorUpdated() if anything breaks
   updateInterfaces(tmpMode);
 }

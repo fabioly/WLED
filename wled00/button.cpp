@@ -11,6 +11,11 @@
 #define WLED_LONG_AP               5000 // how long button 0 needs to be held to activate WLED-AP
 #define WLED_LONG_FACTORY_RESET   10000 // how long button 0 needs to be held to trigger a factory reset
 #define WLED_LONG_BRI_STEPS          16 // how much to increase/decrease the brightness with each long press repetition
+#define WLED_BTN_MULTISAMPLE_COUNT    5   // number of GPIO samples to take for EMI filtering
+#define WLED_BTN_MULTISAMPLE_DELAY_US 200 // microseconds between samples (~800us total)
+#define WLED_BTN_CONFIRM_READS        2   // require N consecutive pressed reads before registering a press
+#define WLED_BTN_BLANKING_PRESET_MS 200   // ignore button presses for this many ms after a preset change (playlist mode)
+#define WLED_DEBOUNCE_PLAYLIST      150   // increased debounce during playlist mode (ms)
 
 static const char _mqtt_topic_button[] PROGMEM = "%s/button/%d";  // optimize flash usage
 static bool buttonBriDirection = false; // true: increase brightness, false: decrease brightness
@@ -101,12 +106,23 @@ bool isButtonPressed(uint8_t i)
       break;
     case BTN_TYPE_PUSH:
     case BTN_TYPE_SWITCH:
-      if (digitalRead(pin) == LOW) return true;
-      break;
+    {
+      // Multi-sample: all samples must agree to filter EMI spikes on long wires
+      for (int s = 0; s < WLED_BTN_MULTISAMPLE_COUNT; s++) {
+        if (digitalRead(pin) != LOW) return false;
+        if (s < WLED_BTN_MULTISAMPLE_COUNT - 1) delayMicroseconds(WLED_BTN_MULTISAMPLE_DELAY_US);
+      }
+      return true;
+    }
     case BTN_TYPE_PUSH_ACT_HIGH:
     case BTN_TYPE_PIR_SENSOR:
-      if (digitalRead(pin) == HIGH) return true;
-      break;
+    {
+      for (int s = 0; s < WLED_BTN_MULTISAMPLE_COUNT; s++) {
+        if (digitalRead(pin) != HIGH) return false;
+        if (s < WLED_BTN_MULTISAMPLE_COUNT - 1) delayMicroseconds(WLED_BTN_MULTISAMPLE_DELAY_US);
+      }
+      return true;
+    }
     case BTN_TYPE_TOUCH:
     case BTN_TYPE_TOUCH_SWITCH:
       #if defined(ARDUINO_ARCH_ESP32) && !defined(CONFIG_IDF_TARGET_ESP32C3)
@@ -132,7 +148,8 @@ void handleSwitch(uint8_t b)
 
   if (buttonLongPressed[b] == buttonPressedBefore[b]) return;
 
-  if (millis() - buttonPressedTime[b] > WLED_DEBOUNCE_THRESHOLD) { //fire edge event only after 50ms without change (debounce)
+  unsigned debounceMs = (currentPlaylist >= 0) ? WLED_DEBOUNCE_PLAYLIST : WLED_DEBOUNCE_THRESHOLD;
+  if (millis() - buttonPressedTime[b] > debounceMs) { //fire edge event only after debounce period without change
     DEBUG_PRINTF_P(PSTR("Switch: Activating  %u\n"), b);
     if (!buttonPressedBefore[b]) { // on -> off
       DEBUG_PRINTF_P(PSTR("Switch: On -> Off (%u)\n"), b);
@@ -256,10 +273,14 @@ void handleButton()
 {
   static unsigned long lastAnalogRead = 0UL;
   static unsigned long lastRun = 0UL;
+  static uint8_t buttonConfirmCount[WLED_MAX_BUTTONS] = {0};
   unsigned long now = millis();
 
   if (strip.isUpdating() && (now - lastRun < ANALOG_BTN_READ_CYCLE+1)) return; // don't interfere with strip update (unless strip is updating continuously, e.g. very long strips)
   lastRun = now;
+
+  // skip button reads briefly after a preset was applied during playlist (EMI from LED transitions)
+  if (currentPlaylist >= 0 && (now - lastPresetApplyTime < WLED_BTN_BLANKING_PRESET_MS)) return;
 
   for (unsigned b=0; b<WLED_MAX_BUTTONS; b++) {
     #ifdef ESP8266
@@ -286,6 +307,13 @@ void handleButton()
     // momentary button logic
     if (isButtonPressed(b)) { // pressed
 
+      // require multiple consecutive pressed readings before registering (EMI filter)
+      if (!buttonPressedBefore[b]) {
+        buttonConfirmCount[b]++;
+        if (buttonConfirmCount[b] < WLED_BTN_CONFIRM_READS) continue;
+        // confirmed — fall through to register the press
+      }
+
       // if all macros are the same, fire action immediately on rising edge
       if (macroButton[b] && macroButton[b] == macroLongPress[b] && macroButton[b] == macroDoublePress[b]) {
         if (!buttonPressedBefore[b])
@@ -309,16 +337,19 @@ void handleButton()
         buttonLongPressed[b] = true;
       }
 
-    } else if (buttonPressedBefore[b]) { //released
+    } else {
+      buttonConfirmCount[b] = 0; // reset confirmation counter when not pressed
+      if (buttonPressedBefore[b]) { //released
       long dur = now - buttonPressedTime[b];
+      unsigned debounceThreshold = (currentPlaylist >= 0) ? WLED_DEBOUNCE_PLAYLIST : WLED_DEBOUNCE_THRESHOLD;
 
       // released after rising-edge short press action
       if (macroButton[b] && macroButton[b] == macroLongPress[b] && macroButton[b] == macroDoublePress[b]) {
-        if (dur > WLED_DEBOUNCE_THRESHOLD) buttonPressedBefore[b] = false; // debounce, blocks button for 50 ms once it has been released
+        if (dur > debounceThreshold) buttonPressedBefore[b] = false; // debounce
         continue;
       }
 
-      if (dur < WLED_DEBOUNCE_THRESHOLD) {buttonPressedBefore[b] = false; continue;} // too short "press", debounce
+      if (dur < debounceThreshold) {buttonPressedBefore[b] = false; continue;} // too short "press", debounce
       bool doublePress = buttonWaitTime[b]; //did we have a short press before?
       buttonWaitTime[b] = 0;
 
@@ -347,6 +378,7 @@ void handleButton()
       buttonPressedBefore[b] = false;
       buttonLongPressed[b] = false;
     }
+    } // close else (not pressed)
 
     //if 350ms elapsed since last short press release it is a short press
     if (buttonWaitTime[b] && now - buttonWaitTime[b] > WLED_DOUBLE_PRESS && !buttonPressedBefore[b]) {
